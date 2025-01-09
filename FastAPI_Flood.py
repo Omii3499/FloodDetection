@@ -154,14 +154,60 @@ def validate_dates(start_date: str, end_date: str):
             status_code=400,
             detail="Invalid date format. Use YYYY-MM-DD"
         )
+# Update this part in the main processing loop
+def create_binary_flood_map(predicted_image, vv_band, vh_band, date, output_dir):
+    """Create a binary flood map with custom colors and legend, including no-data areas."""
+    plt.figure(figsize=(12, 8))
     
-def calculate_statistics(vv_band: np.ndarray, vh_band: np.ndarray, predicted_image: np.ndarray, bbox_coords: list, date: str,region_name: str = "AOI"):
+    # Create a mask for no-data areas
+    no_data_mask = np.isnan(vv_band)  # Basic no-data from NaN
+    sentinel_no_data = (vv_band == -30) & (vh_band == -30)  # Sentinel-1 no-data condition
+    combined_no_data = no_data_mask | sentinel_no_data  # Combine both conditions
+    
+    # Create a modified classification image
+    classification = np.copy(predicted_image)
+    classification[combined_no_data] = 2  # Use 2 for no-data
+    
+    # Create custom colormap (Red for Non-Flooded, Blue for Flooded, Gray for No-Data)
+    colors = ['red', 'blue', 'lightgray']
+    custom_cmap = plt.matplotlib.colors.ListedColormap(colors)
+    
+    # Create the main plot
+    img = plt.imshow(classification, cmap=custom_cmap, interpolation='nearest')
+    plt.title(f'Flood Classification Map - {date}', fontsize=14, pad=20)
+    
+    # Create custom legend patches
+    legend_elements = [
+        plt.Rectangle((0,0),1,1, facecolor='red', label='Non-Flooded'),
+        plt.Rectangle((0,0),1,1, facecolor='blue', label='Flooded'),
+        plt.Rectangle((0,0),1,1, facecolor='lightgray', label='No Data')
+    ]
+    plt.legend(handles=legend_elements, loc='upper right', 
+              bbox_to_anchor=(1.2, 1), fontsize=12)
+    
+    plt.axis('off')
+    plt.tight_layout()
+    
+    # Save the figure
+    plt.savefig(os.path.join(output_dir, f"binary_classified_{date}.jpg"), 
+                bbox_inches='tight', dpi=900)
+    plt.close()
+
+def calculate_statistics(vv_band: np.ndarray, vh_band: np.ndarray, 
+                       predicted_image: np.ndarray, bbox_coords: list, 
+                       date: str, region_name: str = "AOI"):
     """Calculate statistics for the JSON output."""
-    # Calculate pixel counts
-    total_pixels = predicted_image.size
-    flood_pixels = np.sum(predicted_image == 1)
-    non_flood_pixels = np.sum(predicted_image == 0)
-    no_data_pixels = np.sum(np.isnan(predicted_image))
+    # Create combined no-data mask
+    no_data_mask = np.isnan(vv_band)  # Basic no-data from NaN
+    sentinel_no_data = (vv_band == -30) & (vh_band == -30)  # Sentinel-1 no-data condition
+    combined_no_data = no_data_mask | sentinel_no_data  # Combine both conditions
+    
+    # Calculate pixel counts excluding no-data areas
+    valid_pixels = ~combined_no_data
+    total_pixels = np.sum(valid_pixels)
+    flood_pixels = np.sum((predicted_image == 1) & valid_pixels)
+    non_flood_pixels = np.sum((predicted_image == 0) & valid_pixels)
+    no_data_pixels = np.sum(combined_no_data)
     
     # Calculate areas (assuming 10m resolution)
     pixel_area_km2 = 0.0001  # 10m x 10m = 100m2 = 0.0001 km2
@@ -405,14 +451,14 @@ async def process_flood_detection(
                 with open(json_output, 'w') as f:
                     json.dump(stats, f, indent=2)
                 
-                # Save classified image as JPG with legend
-                plt.figure(figsize=(10, 8))
-                classified_img = plt.imshow(predicted_image, cmap='RdYlBu')
-                plt.colorbar(classified_img, label='Flood Classification')
-                plt.title(f'Flood Classification - {date}')
-                plt.axis('off')
-                plt.savefig(os.path.join(output_dir, f"classified_{date}.jpg"))
-                plt.close()
+                # # Save classified image as JPG with legend
+                # plt.figure(figsize=(10, 8))
+                # classified_img = plt.imshow(predicted_image, cmap='RdYlBu')
+                # plt.colorbar(classified_img, label='Flood Classification')
+                # plt.title(f'Flood Classification - {date}')
+                # plt.axis('off')
+                # plt.savefig(os.path.join(output_dir, f"classified_{date}.jpg"))
+                # plt.close()
  
                 # Save Sentinel data
                 sentinel_output = os.path.join(output_dir, f"sentinel1_{date}.tiff")
@@ -453,7 +499,45 @@ async def process_flood_detection(
                     profile.update(count=1, dtype='uint8', nodata=255)
                     with rasterio.open(flood_output, 'w', **profile) as dst:
                         dst.write(predicted_image.astype('uint8'), 1)
+                # Save classified image with binary legend
+                create_binary_flood_map(predicted_image,vv_band, vh_band,date, output_dir)
+
+                # For the visualization panel, also update the third subplot
+                plt.figure(figsize=(18, 6))
                 
+                plt.subplot(131)
+                plt.imshow(vv_band, cmap='gray')
+                plt.title(f'VV Band - {date}')
+                plt.axis('off')
+                
+                plt.subplot(132)
+                plt.imshow(vh_band, cmap='gray')
+                plt.title(f'VH Band - {date}')
+                plt.axis('off')
+                
+                plt.subplot(133)
+                # Create combined no-data mask
+                no_data_mask = np.isnan(vv_band)
+                sentinel_no_data = (vv_band == -30) & (vh_band == -30)
+                combined_no_data = no_data_mask | sentinel_no_data
+                
+                classification = np.copy(predicted_image)
+                classification[combined_no_data] = 2
+
+                colors = ['red', 'blue', 'lightgray']
+                custom_cmap = plt.matplotlib.colors.ListedColormap(colors)
+                plt.imshow(classification, cmap=custom_cmap)
+                plt.title(f'Flood Classification - {date}')
+                legend_elements = [
+                    plt.Rectangle((0,0),1,1, facecolor='red', label='Non-Flooded'),
+                    plt.Rectangle((0,0),1,1, facecolor='blue', label='Flooded'),
+                    plt.Rectangle((0,0),1,1, facecolor='lightgray', label='No Data')
+                ]
+                plt.legend(handles=legend_elements, loc='upper right')
+                plt.axis('off')
+                
+                plt.savefig(os.path.join(output_dir, f"visualization_{date}.png"))
+                plt.close()
                 # Create visualization
                 plt.figure(figsize=(18, 6))
                 
