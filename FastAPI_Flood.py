@@ -40,17 +40,49 @@ class ProcessingResponse(BaseModel):
 def extract_bbox_from_geojson(geojson_data: dict) -> list:
     """Extract bounding box coordinates from GeoJSON data."""
     try:
-        if geojson_data["type"] == "FeatureCollection":
-            coordinates = geojson_data["features"][0]["geometry"]["coordinates"][0]
-        elif geojson_data["type"] == "Feature":
-            coordinates = geojson_data["geometry"]["coordinates"][0]
-        else:
-            coordinates = geojson_data["coordinates"][0]
+        coordinates = []
         
-        lons = [coord[0] for coord in coordinates]
-        lats = [coord[1] for coord in coordinates]
-        bbox = [min(lons), min(lats), max(lons), max(lats)]
+        # Handle different GeoJSON types
+        if geojson_data["type"] == "FeatureCollection":
+            geometry = geojson_data["features"][0]["geometry"]
+            if geometry["type"] == "MultiPolygon":
+                # For MultiPolygon, concatenate all polygon coordinates
+                for polygon in geometry["coordinates"]:
+                    coordinates.extend(polygon[0])  # First ring of each polygon
+            else:  # Regular Polygon
+                coordinates = geometry["coordinates"][0]
+        elif geojson_data["type"] == "Feature":
+            geometry = geojson_data["geometry"]
+            if geometry["type"] == "MultiPolygon":
+                for polygon in geometry["coordinates"]:
+                    coordinates.extend(polygon[0])
+            else:
+                coordinates = geometry["coordinates"][0]
+        else:  # Raw geometry
+            if geojson_data["type"] == "MultiPolygon":
+                for polygon in geojson_data["coordinates"]:
+                    coordinates.extend(polygon[0])
+            else:
+                coordinates = geojson_data["coordinates"][0]
+        
+        if not coordinates:
+            raise ValueError("No coordinates found in GeoJSON")
+            
+        # Extract all x and y coordinates
+        x_coords = [float(coord[0]) for coord in coordinates]
+        y_coords = [float(coord[1]) for coord in coordinates]
+        
+        # Calculate bounding box
+        bbox = [
+            min(x_coords),  # min longitude
+            min(y_coords),  # min latitude
+            max(x_coords),  # max longitude
+            max(y_coords)   # max latitude
+        ]
+        
+        print(f"Extracted bbox: {bbox}")  # Debug print
         return bbox
+        
     except Exception as e:
         raise HTTPException(
             status_code=400,
@@ -65,25 +97,38 @@ def validate_bbox(bbox: list) -> bool:
             detail="Bbox must contain exactly 4 coordinates"
         )
         
-    lon_min, lat_min, lon_max, lat_max = bbox
-    
-    if not all(-180 <= lon <= 180 for lon in [lon_min, lon_max]):
-        raise HTTPException(
-            status_code=400,
-            detail="Longitude must be between -180 and 180 degrees"
-        )
-    if not all(-90 <= lat <= 90 for lat in [lat_min, lat_max]):
-        raise HTTPException(
-            status_code=400,
-            detail="Latitude must be between -90 and 90 degrees"
-        )
+    try:
+        # Convert all coordinates to float and unpack
+        lon_min, lat_min, lon_max, lat_max = [float(coord) for coord in bbox]
         
-    if abs(lon_max - lon_min) > 5 or abs(lat_max - lat_min) > 5:
+        # Validate longitude values
+        if not (-180 <= lon_min <= 180 and -180 <= lon_max <= 180):
+            raise HTTPException(
+                status_code=400,
+                detail="Longitude must be between -180 and 180 degrees"
+            )
+            
+        # Validate latitude values    
+        if not (-90 <= lat_min <= 90 and -90 <= lat_max <= 90):
+            raise HTTPException(
+                status_code=400,
+                detail="Latitude must be between -90 and 90 degrees"
+            )
+            
+        # Validate bounding box size
+        if abs(lon_max - lon_min) > 5 or abs(lat_max - lat_min) > 5:
+            raise HTTPException(
+                status_code=400,
+                detail="Bounding box too large (max 5 degrees)"
+            )
+            
+        return True
+        
+    except ValueError as e:
         raise HTTPException(
             status_code=400,
-            detail="Bounding box too large (max 5 degrees)"
+            detail=f"Invalid coordinate values: {str(e)}"
         )
-    return True
 
 def validate_dates(start_date: str, end_date: str):
     """Validate input dates."""
@@ -109,16 +154,101 @@ def validate_dates(start_date: str, end_date: str):
             status_code=400,
             detail="Invalid date format. Use YYYY-MM-DD"
         )
+    
+def calculate_statistics(vv_band: np.ndarray, vh_band: np.ndarray, predicted_image: np.ndarray, bbox_coords: list, date: str,region_name: str = "AOI"):
+    """Calculate statistics for the JSON output."""
+    # Calculate pixel counts
+    total_pixels = predicted_image.size
+    flood_pixels = np.sum(predicted_image == 1)
+    non_flood_pixels = np.sum(predicted_image == 0)
+    no_data_pixels = np.sum(np.isnan(predicted_image))
+    
+    # Calculate areas (assuming 10m resolution)
+    pixel_area_km2 = 0.0001  # 10m x 10m = 100m2 = 0.0001 km2
+    total_area_km2 = total_pixels * pixel_area_km2
+    flood_area_km2 = flood_pixels * pixel_area_km2
+    
+    # Calculate band statistics
+    vv_stats = {
+        "mean": float(np.nanmean(vv_band)),
+        "std": float(np.nanstd(vv_band))
+    }
+    
+    vh_stats = {
+        "mean": float(np.nanmean(vh_band)),
+        "std": float(np.nanstd(vh_band))
+    }
+    
+    # Calculate simple confidence metrics (example implementation)
+    model_confidence = 0.85  # This should be replaced with actual model confidence
+    spatial_consistency = 1 - (np.sum(np.isnan(predicted_image)) / total_pixels)
+    
+    return {
+        "metadata": {
+            "timestamp": date,
+            "source": "Sentinel-1",
+            "region": region_name,
+            "spatial_extent": {
+                "bbox": bbox_coords,
+                "crs": "EPSG:4326"
+            }
+        },
+        "flood_analysis": {
+            "affected_areas": {
+                "total_area_km2": float(total_area_km2),
+                "flood_area_km2": float(flood_area_km2),
+                "percentage": float(flood_area_km2 / total_area_km2 * 100)
+            },
+            "confidence_metrics": {
+                "model_confidence": float(model_confidence),
+                "spatial_consistency": float(spatial_consistency)
+            }
+        },
+        "statistics": {
+            "pixel_counts": {
+                "total": int(total_pixels),
+                "flood": int(flood_pixels),
+                "non_flood": int(non_flood_pixels),
+                "no_data": int(no_data_pixels)
+            },
+            "band_statistics": {
+                "vv": vv_stats,
+                "vh": vh_stats
+            }
+        }
+    }
 
-def validate_output_dir(output_dir: str):
-    """Validate and create output directory."""
+def validate_and_clean_output_dir(output_dir: str) -> str:
+    """Clean and validate the output directory path."""
     try:
-        os.makedirs(output_dir, exist_ok=True)
+        # Remove any quotes and prefixes
+        cleaned_path = output_dir.strip("'").strip('"')
+        if cleaned_path.startswith('r'):
+            cleaned_path = cleaned_path[1:].strip("'").strip('"')
+        
+        # Replace backslashes with forward slashes
+        cleaned_path = cleaned_path.replace('\\', '/')
+        
+        # Remove any double forward slashes
+        while '//' in cleaned_path:
+            cleaned_path = cleaned_path.replace('//', '/')
+            
+        # Create directory if it doesn't exist
+        os.makedirs(cleaned_path, exist_ok=True)
+        
         # Test write permissions
-        test_file = os.path.join(output_dir, "test.txt")
-        with open(test_file, 'w') as f:
-            f.write("test")
-        os.remove(test_file)
+        test_file = os.path.join(cleaned_path, "test.txt")
+        try:
+            with open(test_file, 'w') as f:
+                f.write("test")
+            os.remove(test_file)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot write to output directory: {str(e)}"
+            )
+            
+        return cleaned_path
     except Exception as e:
         raise HTTPException(
             status_code=400,
@@ -126,7 +256,8 @@ def validate_output_dir(output_dir: str):
         )
 
 def process_sentinel_data(date: str, bbox_coords: list, config: SHConfig, 
-                         flood_model, output_dir: str, resolution: int = 10):
+                         flood_model, output_dir: str, region_name: str = "AOI",
+                         resolution: int = 10):
     """Process Sentinel data for a given date."""
     # Calculate tile size
     center_lat = (bbox_coords[1] + bbox_coords[3]) / 2
@@ -136,8 +267,6 @@ def process_sentinel_data(date: str, bbox_coords: list, config: SHConfig,
     
     aoi_bbox = BBox(bbox=bbox_coords, crs=CRS.WGS84)
     size = bbox_to_dimensions(aoi_bbox, resolution=resolution)
-    
-    # Ensure size doesn't exceed limits
     size = [min(2500, s) for s in size]
     
     evalscript = """
@@ -187,7 +316,17 @@ def process_sentinel_data(date: str, bbox_coords: list, config: SHConfig,
     predictions = flood_model.predict(features)
     predicted_image = predictions.reshape(vv_band.shape)
     
-    return vv_band, vh_band, predicted_image
+    # Calculate statistics here, passing the date parameter
+    stats = calculate_statistics(
+        vv_band=vv_band,
+        vh_band=vh_band,
+        predicted_image=predicted_image,
+        bbox_coords=bbox_coords,
+        date=date,
+        region_name=region_name
+    )
+    
+    return vv_band, vh_band, predicted_image, stats
 
 @app.post("/process_flood_detection", response_model=ProcessingResponse)
 async def process_flood_detection(
@@ -197,6 +336,13 @@ async def process_flood_detection(
     output_dir: str = Form(...)
 ):
     try:
+
+        geojson_filename = geojson.filename
+        region_name = os.path.splitext(geojson_filename)[0] 
+
+        # Clean and validate the output directory
+        output_dir = validate_and_clean_output_dir(output_dir)
+        
         # Read and validate GeoJSON
         geojson_content = await geojson.read()
         geojson_data = json.loads(geojson_content)
@@ -206,9 +352,6 @@ async def process_flood_detection(
         # Validate dates
         validate_dates(start_date, end_date)
         
-        # Validate output directory
-        validate_output_dir(output_dir)
-        
         # Initialize Sentinel Hub
         config = SHConfig()
         config.sh_client_id = "sh-298f8633-2679-497b-9354-7cd820eecd13"
@@ -217,14 +360,11 @@ async def process_flood_detection(
         config.sh_base_url = "https://sh.dataspace.copernicus.eu"
         config.save()
         
-        # Set up AOI
-        aoi_bbox = BBox(bbox=bbox_coords, crs=CRS.WGS84)
-        
         # Search for available data
         catalog = SentinelHubCatalog(config=config)
         search_iterator = catalog.search(
             DataCollection.SENTINEL1,
-            bbox=aoi_bbox,
+            bbox=BBox(bbox=bbox_coords, crs=CRS.WGS84),
             time=(start_date, end_date),
             fields={"include": ["id", "properties.datetime"], "exclude": []},
         )
@@ -240,26 +380,40 @@ async def process_flood_detection(
             )
 
         # Load flood detection model
-        model_path = r"B:\GreenAnt\FloodDetection\xgboost_binary_model.joblib"
+        model_path = r"B:\GreenAnt\FloodDetection\Flood_Model.joblib"
         flood_model = joblib.load(model_path)
         
         processed_dates = []
         total_dates = len(available_dates)
 
-        
-        
         # Process each date
         for index, date in enumerate(available_dates, 1):
             print(f"Processing date {index}/{total_dates}: {date}")
             try:
-                vv_band, vh_band, predicted_image = process_sentinel_data(
+                # Process the data
+                vv_band, vh_band, predicted_image, stats = process_sentinel_data(
                     date=date,
                     bbox_coords=bbox_coords,
                     config=config,
                     flood_model=flood_model,
-                    output_dir=output_dir
+                    output_dir=output_dir,
+                    region_name=region_name
                 )
                 
+                # Save JSON output
+                json_output = os.path.join(output_dir, f"flood_analysis_{date}.json")
+                with open(json_output, 'w') as f:
+                    json.dump(stats, f, indent=2)
+                
+                # Save classified image as JPG with legend
+                plt.figure(figsize=(10, 8))
+                classified_img = plt.imshow(predicted_image, cmap='RdYlBu')
+                plt.colorbar(classified_img, label='Flood Classification')
+                plt.title(f'Flood Classification - {date}')
+                plt.axis('off')
+                plt.savefig(os.path.join(output_dir, f"classified_{date}.jpg"))
+                plt.close()
+ 
                 # Save Sentinel data
                 sentinel_output = os.path.join(output_dir, f"sentinel1_{date}.tiff")
                 driver = gdal.GetDriverByName('GTiff')
@@ -327,7 +481,7 @@ async def process_flood_detection(
             except Exception as e:
                 print(f"Error processing date {date}: {str(e)}")
                 continue
-        
+
         return ProcessingResponse(
             status="completed",
             output_directory=output_dir,
@@ -342,7 +496,7 @@ async def process_flood_detection(
             processed_dates=[],
             error_message=str(e)
         )
-
+    
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
